@@ -1,0 +1,664 @@
+// =============================================================================
+//  Mission Orbit ($ORBIT) — PostgreSQL / Prisma schema
+//  apps/api/prisma/schema.prisma
+//
+//  Conventions
+//  - Points are BigInt (whole points). $GRAM amounts are BigInt in nano-units
+//    (1 GRAM = 1_000_000_000). $ORBIT allocations are BigInt in base units.
+//  - Every balance change goes through PointsLedger (append-only, idempotent).
+//    User.pointsBalance and Score are denormalised caches of the ledger.
+//  - Anything the client "claims" (angle, velocity, checksum) is stored next
+//    to what the server derived (outcome, precision, points).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum Chain {
+  TON
+  SOLANA
+}
+
+enum PayloadType {
+  SATELLITE
+  ROCKET
+  PROBE
+}
+
+enum LaunchStatus {
+  ISSUED // nonce handed out, fuel spent, waiting for the vector
+  SUBMITTED // vector received, simulation queued / running
+  VALIDATED // server re-simulation done, points applied
+  REJECTED // checksum / physics / rate check failed
+  EXPIRED // nonce not used before expiresAt
+}
+
+enum LaunchOutcome {
+  STABLE_ORBIT
+  CRASH
+  DEEP_SPACE_DRIFT
+}
+
+enum EquipmentType {
+  BOOSTER_ROCKET
+  TRAJECTORY_COMPUTER
+  PAYLOAD_SKIN
+}
+
+enum PurchaseKind {
+  EQUIPMENT
+  PRESALE
+}
+
+enum PurchaseStatus {
+  AWAITING_PAYMENT // intent created, wallet has not signed yet
+  CONFIRMING // tx seen on-chain, waiting for finality
+  CONFIRMED // verified, goods / allocation delivered
+  FAILED
+  EXPIRED // validUntil passed with no matching tx
+  REFUNDED
+}
+
+enum AllocationStatus {
+  RESERVED // paid, TGE has not happened
+  CLAIMABLE // TGE done, Solana address bound
+  CLAIMED
+  VOID
+}
+
+enum LedgerSource {
+  LAUNCH
+  TASK
+  REFERRAL_SHARE
+  REFERRAL_BONUS
+  AD_REWARD
+  PURCHASE_BONUS
+  ADMIN_ADJUSTMENT
+}
+
+enum TaskType {
+  TELEGRAM_CHANNEL
+  X_FOLLOW
+  X_REPOST
+  WATCH_VIDEO
+  ONCHAIN_TX
+  CONNECT_WALLET
+  CUSTOM
+}
+
+enum UserTaskStatus {
+  STARTED
+  VERIFIED
+  CLAIMED
+  REJECTED
+}
+
+enum ReferralRewardType {
+  POINT_SHARE
+  PURCHASE_BONUS
+}
+
+enum AdProvider {
+  ADSGRAM
+  MEGAPUSH
+  TELEGRAM_ADS
+}
+
+enum AdRewardType {
+  EXTRA_FUEL
+  EXTRA_TRY
+}
+
+enum RiskSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// -----------------------------------------------------------------------------
+// Identity, sessions and trust
+// -----------------------------------------------------------------------------
+
+model User {
+  id           String  @id @default(cuid())
+  telegramId   BigInt  @unique
+  username     String?
+  firstName    String
+  lastName     String?
+  languageCode String?
+  isPremium    Boolean @default(false)
+  photoUrl     String?
+
+  // Economy caches (source of truth is PointsLedger)
+  pointsBalance BigInt   @default(0)
+  fuel          Int      @default(5)
+  maxFuel       Int      @default(5)
+  fuelUpdatedAt DateTime @default(now())
+
+  // Public, non-guessable code used in t.me/MissionOrbitBot/app?startapp=ref_<code>
+  referralCode String @unique
+
+  // Trust & safety
+  riskScore           Int       @default(0)
+  turnstileVerifiedAt DateTime?
+  bannedAt            DateTime?
+  banReason           String?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  lastSeenAt DateTime @default(now())
+
+  wallets           Wallet[]
+  devices           Device[]
+  sessions          Session[]
+  launches          Launch[]
+  scores            Score[]
+  ledger            PointsLedger[]
+  equipment         UserEquipment[]
+  purchases         Purchase[]
+  allocations       PresaleAllocation[]
+  userTasks         UserTask[]
+  invitees          Referral[]          @relation("Inviter")
+  referredBy        Referral?           @relation("Invitee")
+  referralStats     ReferralStat[]
+  adViews           AdView[]
+  riskEvents        RiskEvent[]
+
+  @@index([lastSeenAt])
+  @@map("users")
+}
+
+model Wallet {
+  id         String    @id @default(cuid())
+  userId     String
+  chain      Chain
+  address    String
+  publicKey  String? // TON: from ton_proof
+  verifiedAt DateTime? // TON: ton_proof verified / Solana: signed nonce message verified
+  isPrimary  Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // One wallet can only ever belong to one account per chain (anti-sybil)
+  @@unique([chain, address])
+  @@index([userId, chain])
+  @@map("wallets")
+}
+
+model Device {
+  id              String   @id @default(cuid())
+  userId          String
+  fingerprintHash String
+  ipHash          String
+  userAgent       String?
+  platform        String?
+  seenCount       Int      @default(1)
+  firstSeenAt     DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions Session[]
+
+  @@unique([userId, fingerprintHash])
+  @@index([fingerprintHash]) // many accounts on one fingerprint => farm signal
+  @@index([ipHash])
+  @@map("devices")
+}
+
+model Session {
+  id        String    @id @default(cuid()) // JWT jti
+  userId    String
+  deviceId  String?
+  ipHash    String?
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model RiskEvent {
+  id        String       @id @default(cuid())
+  userId    String?
+  severity  RiskSeverity
+  kind      String // e.g. "checksum_mismatch", "impossible_cadence", "shared_fingerprint"
+  details   Json?
+  createdAt DateTime     @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([kind, createdAt])
+  @@map("risk_events")
+}
+
+// -----------------------------------------------------------------------------
+// Seasons, planets and the Launch to Orbit game
+// -----------------------------------------------------------------------------
+
+model Season {
+  id       String   @id @default(cuid())
+  slug     String   @unique
+  name     String
+  startsAt DateTime
+  endsAt   DateTime
+  isActive Boolean  @default(false)
+
+  launches      Launch[]
+  scores        Score[]
+  ledger        PointsLedger[]
+  referralStats ReferralStat[]
+
+  @@map("seasons")
+}
+
+// Server-side physics config. The API re-simulates every launch against this
+// row, so the client never gets to choose gravity, radius or the target band.
+model Planet {
+  id                String  @id @default(cuid())
+  slug              String  @unique
+  name              String
+  difficulty        Int // 1..10
+  mass              Float
+  radius            Float
+  gravityConstant   Float
+  orbitMinAltitude  Float // stable band, lower edge
+  orbitMaxAltitude  Float // stable band, upper edge
+  maxEccentricity   Float
+  minRevolutions    Float   @default(1.0)
+  simConfig         Json // timestep, maxSteps, atmosphere drag, world bounds
+  basePoints        Int
+  sortOrder         Int     @default(0)
+  isActive          Boolean @default(true)
+
+  launches Launch[]
+
+  @@map("planets")
+}
+
+model Launch {
+  id       String @id @default(cuid())
+  userId   String
+  planetId String
+  seasonId String
+
+  // Anti-replay: issued by POST /launch/start, single use, short lived
+  nonce     String       @unique
+  status    LaunchStatus @default(ISSUED)
+  issuedAt  DateTime     @default(now())
+  expiresAt DateTime
+
+  // What the client claims
+  payloadType        PayloadType?
+  angleDeg           Float?
+  velocity           Float?
+  payloadMass        Float?
+  clientLaunchedAtMs BigInt?
+  clientChecksum     String?
+  submittedAt        DateTime?
+
+  // Equipment the server resolved when the nonce was issued
+  // e.g. { "pointMultiplierBps": 12500, "forgivenessMarginPct": 4, "skus": ["booster_mk2"] }
+  loadout Json
+
+  // What the server derived
+  outcome         LaunchOutcome?
+  precision       Float? // 0..1, how centred in the stable band
+  apoapsis        Float?
+  periapsis       Float?
+  eccentricity    Float?
+  multiplierBps   Int            @default(10000)
+  pointsAwarded   Int            @default(0)
+  simHash         String? // hash of the deterministic sim output, for audits
+  rejectReason    String?
+  validatedAt     DateTime?
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planet Planet @relation(fields: [planetId], references: [id])
+  season Season @relation(fields: [seasonId], references: [id])
+
+  @@index([userId, issuedAt(sort: Desc)])
+  @@index([seasonId, status])
+  @@index([status, expiresAt])
+  @@map("launches")
+}
+
+// -----------------------------------------------------------------------------
+// Scores and the points ledger
+// -----------------------------------------------------------------------------
+
+// Per user, per season aggregate. Drives the main leaderboard.
+model Score {
+  id                 String   @id @default(cuid())
+  userId             String
+  seasonId           String
+  totalPoints        BigInt   @default(0)
+  launchPoints       BigInt   @default(0)
+  taskPoints         BigInt   @default(0)
+  referralPoints     BigInt   @default(0)
+  adPoints           BigInt   @default(0)
+  purchasePoints     BigInt   @default(0)
+  launchesCount      Int      @default(0)
+  successfulLaunches Int      @default(0)
+  bestPrecision      Float    @default(0)
+  currentStreak      Int      @default(0)
+  updatedAt          DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  season Season @relation(fields: [seasonId], references: [id])
+
+  @@unique([userId, seasonId])
+  @@index([seasonId, totalPoints(sort: Desc)])
+  @@map("scores")
+}
+
+// Append-only. One row per balance change; idempotencyKey makes retries safe
+// (e.g. "launch:<launchId>", "task:<userId>:<taskId>", "ref:<referralId>:<launchId>").
+model PointsLedger {
+  id             String       @id @default(cuid())
+  userId         String
+  seasonId       String?
+  delta          BigInt
+  balanceAfter   BigInt
+  source         LedgerSource
+  refType        String?
+  refId          String?
+  idempotencyKey String       @unique
+  createdAt      DateTime     @default(now())
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  season Season? @relation(fields: [seasonId], references: [id])
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([source, createdAt])
+  @@map("points_ledger")
+}
+
+// -----------------------------------------------------------------------------
+// Store: equipment catalogue and inventory
+// -----------------------------------------------------------------------------
+
+model EquipmentItem {
+  id            String        @id @default(cuid())
+  sku           String        @unique
+  type          EquipmentType
+  name          String
+  description   String?
+  tier          Int           @default(1)
+  priceGramNano BigInt
+  // e.g. { "pointMultiplierBps": 500, "forgivenessMarginPct": 2 }
+  effects       Json
+  imageUrl      String?
+  sortOrder     Int           @default(0)
+  isActive      Boolean       @default(true)
+
+  owned     UserEquipment[]
+  purchases Purchase[]
+
+  @@index([type, isActive])
+  @@map("equipment_items")
+}
+
+model UserEquipment {
+  id         String   @id @default(cuid())
+  userId     String
+  itemId     String
+  purchaseId String?  @unique
+  isEquipped Boolean  @default(false)
+  acquiredAt DateTime @default(now())
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  item     EquipmentItem @relation(fields: [itemId], references: [id])
+  purchase Purchase?     @relation(fields: [purchaseId], references: [id])
+
+  @@unique([userId, itemId])
+  @@map("user_equipment")
+}
+
+// -----------------------------------------------------------------------------
+// $GRAM payments (TON) and the $ORBIT presale
+// -----------------------------------------------------------------------------
+
+model PresaleRound {
+  id                  String    @id @default(cuid())
+  slug                String    @unique
+  name                String
+  orbitPerGram        Decimal   @db.Decimal(38, 12)
+  minPurchaseGramNano BigInt
+  maxPerUserGramNano  BigInt
+  hardCapGramNano     BigInt
+  raisedGramNano      BigInt    @default(0)
+  startsAt            DateTime
+  endsAt              DateTime
+  tgeAt               DateTime?
+  isActive            Boolean   @default(false)
+
+  purchases   Purchase[]
+  allocations PresaleAllocation[]
+
+  @@map("presale_rounds")
+}
+
+model Purchase {
+  id     String         @id @default(cuid())
+  userId String
+  kind   PurchaseKind
+  status PurchaseStatus @default(AWAITING_PAYMENT)
+
+  itemId  String? // kind = EQUIPMENT
+  roundId String? // kind = PRESALE
+
+  amountGramNano BigInt
+
+  // Payment intent the wallet must satisfy
+  paymentReference String   @unique // comment / payload the tx has to carry
+  treasuryAddress  String
+  validUntil       DateTime
+
+  // Filled in by the verifier
+  senderAddress String?
+  tonTxHash     String?   @unique
+  tonLt         BigInt?
+  confirmedAt   DateTime?
+  failureReason String?
+
+  // Snapshot so later rate changes never touch history
+  rateOrbitPerGram Decimal? @db.Decimal(38, 12)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user       User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  item       EquipmentItem?     @relation(fields: [itemId], references: [id])
+  round      PresaleRound?      @relation(fields: [roundId], references: [id])
+  allocation PresaleAllocation?
+  delivered  UserEquipment?
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, validUntil])
+  @@map("purchases")
+}
+
+model PresaleAllocation {
+  id         String           @id @default(cuid())
+  userId     String
+  roundId    String
+  purchaseId String           @unique
+  orbitBase  BigInt // $ORBIT in base units
+  status     AllocationStatus @default(RESERVED)
+
+  // Filled at TGE from the user's verified Solana wallet
+  claimAddress     String?
+  claimTxSignature String?   @unique
+  claimedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  user     User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  round    PresaleRound @relation(fields: [roundId], references: [id])
+  purchase Purchase     @relation(fields: [purchaseId], references: [id])
+
+  @@index([userId])
+  @@index([roundId, status])
+  @@map("presale_allocations")
+}
+
+// Raw chain events ingested from webhooks / pollers. Makes verification
+// idempotent: the same tx delivered twice is one row.
+model ChainEvent {
+  id          String    @id @default(cuid())
+  chain       Chain
+  txHash      String
+  lt          BigInt?
+  payload     Json
+  purchaseId  String?
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@unique([chain, txHash])
+  @@index([processedAt])
+  @@map("chain_events")
+}
+
+// -----------------------------------------------------------------------------
+// Tasks
+// -----------------------------------------------------------------------------
+
+model Task {
+  id           String    @id @default(cuid())
+  slug         String    @unique
+  type         TaskType
+  title        String
+  description  String?
+  iconUrl      String?
+  rewardPoints Int
+  // e.g. { "channelId": "@MissionOrbit" } | { "url": "https://x.com/..." } | { "videoId": "..." }
+  config       Json
+  sortOrder    Int       @default(0)
+  startsAt     DateTime?
+  endsAt       DateTime?
+  isActive     Boolean   @default(true)
+
+  userTasks UserTask[]
+
+  @@map("tasks")
+}
+
+model UserTask {
+  id               String         @id @default(cuid())
+  userId           String
+  taskId           String
+  status           UserTaskStatus @default(STARTED)
+  attempts         Int            @default(0)
+  verificationMeta Json?
+  startedAt        DateTime       @default(now())
+  verifiedAt       DateTime?
+  claimedAt        DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, taskId])
+  @@index([taskId, status])
+  @@map("user_tasks")
+}
+
+// -----------------------------------------------------------------------------
+// Referrals
+// -----------------------------------------------------------------------------
+
+// Tier is decided by how many qualified invitees the inviter has.
+model ReferralTier {
+  id                  String @id @default(cuid())
+  level               Int    @unique
+  name                String
+  minQualifiedInvites Int
+  sharePctBps         Int // 1000 = 10% of invitee points
+  purchaseBonusPoints Int // flat points when an invitee pays with $GRAM
+
+  @@map("referral_tiers")
+}
+
+model Referral {
+  id             String    @id @default(cuid())
+  inviterId      String
+  inviteeId      String    @unique // an account can only be referred once
+  qualifiedAt    DateTime? // e.g. first validated launch
+  firstPurchaseAt DateTime?
+  createdAt      DateTime  @default(now())
+
+  inviter User             @relation("Inviter", fields: [inviterId], references: [id], onDelete: Cascade)
+  invitee User             @relation("Invitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+  rewards ReferralReward[]
+
+  @@index([inviterId, createdAt(sort: Desc)])
+  @@map("referrals")
+}
+
+model ReferralReward {
+  id         String             @id @default(cuid())
+  referralId String
+  type       ReferralRewardType
+  points     BigInt
+  purchaseId String?
+  createdAt  DateTime           @default(now())
+
+  referral Referral @relation(fields: [referralId], references: [id], onDelete: Cascade)
+
+  @@index([referralId, createdAt])
+  @@map("referral_rewards")
+}
+
+// Denormalised counters behind the referral leaderboard
+model ReferralStat {
+  id             String   @id @default(cuid())
+  userId         String
+  seasonId       String
+  invitesCount   Int      @default(0)
+  qualifiedCount Int      @default(0)
+  pointsEarned   BigInt   @default(0)
+  updatedAt      DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  season Season @relation(fields: [seasonId], references: [id])
+
+  @@unique([userId, seasonId])
+  @@index([seasonId, pointsEarned(sort: Desc)])
+  @@map("referral_stats")
+}
+
+// -----------------------------------------------------------------------------
+// Rewarded ads
+// -----------------------------------------------------------------------------
+
+model AdView {
+  id              String       @id @default(cuid())
+  userId          String
+  provider        AdProvider
+  placementId     String?
+  rewardType      AdRewardType
+  providerEventId String?      @unique // from the provider's server-to-server callback
+  startedAt       DateTime     @default(now())
+  completedAt     DateTime?
+  rewardApplied   Boolean      @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, startedAt(sort: Desc)])
+  @@map("ad_views")
+}
